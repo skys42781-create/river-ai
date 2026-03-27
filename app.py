@@ -5,55 +5,57 @@ from tensorflow.keras.models import load_model
 from sklearn.preprocessing import MinMaxScaler
 
 # [1. 기본 설정]
-st.set_page_config(page_title="한강 유량 시점별 분석", layout="wide")
-st.title("🌊 특정 시점(T) 기준 향후 3일 예측 및 검증")
+st.set_page_config(page_title="한강 유량 고도화 예측", layout="wide")
+st.title("🌊 데이터 가공 기반 유량 예측 시스템 (Look-back: 30D)")
+st.markdown("---")
 
 @st.cache_resource
 def get_model():
+    # 학습 시 look_back을 30으로 설정한 새로운 모델 파일이 필요합니다.
     return load_model('river_model_final.h5', compile=False)
 
 model = get_model()
 
-# [2. 데이터 로드: 이름 충돌 방지 로직 강화]
+# [2. 데이터 로드 및 이동 평균(Smoothing) 적용]
 @st.cache_data
-def load_data():
+def load_processed_data():
     csv_url = "https://raw.githubusercontent.com/skys42781-create/river-ai/main/latest_river_data.csv"
     df = pd.read_csv(csv_url)
     
-    # 원본 파일의 컬럼명을 유연하게 한글로 통일
-    name_map = {
-        'rf': '강수량', 'rf(mm)': '강수량', '강수량(mm)': '강수량',
-        'fw': '유량', 'fw(m3/s)': '유량', '유량(m3/s)': '유량',
-        'ymdhm': '날짜', '년월일(yyyyMMdd)': '날짜'
-    }
+    # 컬럼명 통일
+    name_map = {'rf': '강수량', 'fw': '유량', 'ymdhm': '날짜', '년월일(yyyyMMdd)': '날짜'}
     df = df.rename(columns=name_map)
-    
-    # 필요한 데이터만 추출
-    df = df[['날짜', '강수량', '유량']]
-    df['강수량'] = pd.to_numeric(df['강수량'], errors='coerce')
-    df['유량'] = pd.to_numeric(df['유량'], errors='coerce')
-    
-    # 날짜 형식 정리 (앞 8자리)
+    df[['강수량', '유량']] = df[['강수량', '유량']].apply(pd.to_numeric, errors='coerce')
     df['날짜'] = df['날짜'].astype(str).str[:8]
-    return df.dropna().query("강수량 >= 0 and 유량 >= 0").sort_values('날짜').reset_index(drop=True)
+    df = df.dropna().query("강수량 >= 0 and 유량 >= 0").sort_values('날짜').reset_index(drop=True)
 
-df = load_data()
+    # --- [데이터 가공: 3일 이동 평균] ---
+    # 모델이 너무 예민하게 반응하지 않도록 데이터를 부드럽게 만듭니다.
+    df['강수량_SMA'] = df['강수량'].rolling(window=3, min_periods=1).mean()
+    df['유량_SMA'] = df['유량'].rolling(window=3, min_periods=1).mean()
+    
+    return df
 
-# [3. 메인 분석 로직]
-if df is not None and len(df) >= 10:
+df = load_processed_data()
+
+# [3. 메인 분석 화면]
+if df is not None and len(df) >= 35: # 30일치 분석을 위해 최소 35일 필요
+    # 스케일러 (가공된 데이터를 기준으로 학습했다면 가공 데이터를 넣어야 함)
     scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(df[['강수량', '유량']].values)
+    # 주의: 학습 시 '강수량_SMA', '유량_SMA'를 썼다면 여기서도 SMA 컬럼을 넣으세요.
+    data_for_scale = df[['강수량_SMA', '유량_SMA']].values
+    scaled = scaler.fit_transform(data_for_scale)
+
+    st.sidebar.header("📅 분석 시점 선택")
+    # 30일 데이터가 확보된 시점부터 선택 가능
+    date_list = df['날짜'].tolist()[30:] 
+    selected_t = st.sidebar.selectbox("기준일(T) 선택", date_list, index=len(date_list)-1)
     
-    # 사이드바에서 기준 날짜(T) 선택
-    st.sidebar.header("📅 분석 시점 설정")
-    date_list = df['날짜'].tolist()[7:] # 최소 7일 데이터 확보된 날짜부터
-    selected_t = st.sidebar.selectbox("기준 날짜(T) 선택", date_list, index=len(date_list)-1)
-    
-    # 선택된 날짜의 위치 찾기
     pos = df[df['날짜'] == selected_t].index[0]
     
-    # T 시점의 7일 데이터를 입력으로 사용
-    input_seq = scaled[pos-6 : pos+1].reshape(1, 7, 2)
+    # [4. 예측 실행: 과거 30일치 입력]
+    # (1, 30, 2) 구조로 변경됨
+    input_seq = scaled[pos-29 : pos+1].reshape(1, 30, 2)
     preds_scaled = model.predict(input_seq, verbose=0)[0]
     
     def to_real(s_val):
@@ -62,28 +64,27 @@ if df is not None and len(df) >= 10:
     
     preds_real = [to_real(p) for p in preds_scaled]
 
-    # [4. 결과 출력: T+1, T+2, T+3]
-    st.subheader(f"📌 {selected_t} (T) 시점 기준 예측 결과")
-    cols = st.columns(3)
+    # [5. 결과 대시보드]
+    st.subheader(f"📌 {selected_t} 기준 향후 3일 유량 (30일 흐름 분석 결과)")
+    c1, c2, c3 = st.columns(3)
     
     for i in range(3):
-        with cols[i]:
+        with [c1, c2, c3][i]:
             st.metric(f"T+{i+1}일 예측", f"{preds_real[i]:.2f} m³/s")
-            
-            # 사후 검증 (실제값이 데이터에 존재하는 경우)
+            # 사후 검증
             if pos + i + 1 < len(df):
                 actual = df['유량'].iloc[pos + i + 1]
-                diff = preds_real[i] - actual
-                error_pct = (abs(diff) / actual) * 100
-                st.write(f"**실제 관측치:** {actual:.2f}")
-                st.write(f"**오차율:** {error_pct:.1f}%")
-            else:
-                st.write("*(미래 시점으로 실제값 없음)*")
+                error = abs(preds_real[i] - actual) / actual * 100
+                st.write(f"**실제값:** {actual:.2f} | **오차율:** {error:.1f}%")
 
-    # [5. 데이터 테이블 확인]
+    # [6. 시각화: 원본 vs 가공 데이터 비교]
     st.divider()
-    st.subheader("📊 데이터 무결성 확인 (선택 시점 주변)")
-    st.table(df.iloc[max(0, pos-5) : pos+4])
+    st.subheader("📈 데이터 가공(Smoothing) 효과 확인")
+    st.info("💡 옅은 선은 원본 데이터이고, 굵은 선은 모델이 학습한 3일 이동 평균 데이터입니다.")
+    
+    # 차트용 데이터 (최근 40일)
+    chart_df = df.iloc[max(0, pos-40) : pos+1][['날짜', '유량', '유량_SMA']].set_index('날짜')
+    st.line_chart(chart_df)
 
 else:
-    st.error("데이터를 불러오지 못했거나 양이 부족합니다.")
+    st.warning("분석을 위해 최소 35일 이상의 데이터가 필요합니다. get_data.py를 통해 더 많은 데이터를 수집하세요.")
