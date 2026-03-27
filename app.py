@@ -3,95 +3,89 @@ import pandas as pd
 import numpy as np
 from tensorflow.keras.models import load_model
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# [1. 기본 설정 및 한글 폰트]
-st.set_page_config(page_title="한강 유량 예측 시스템", layout="wide")
-# 스트림릿 클라우드(리눅스) 환경에서는 나눔고딕을 기본으로 설정하는 것이 좋습니다.
-# 만약 폰트 에러가 나면 이 부분은 생략해도 수치 표시는 잘 됩니다.
+# [1. 설정]
+st.set_page_config(page_title="한강 유량 정밀 예측", layout="wide")
+st.title("🌊 맞춤형 유량 예측 및 오차 분석 시스템")
 
-st.title("🌊 한강 실시간 유량 예측 시스템 (GitHub Relay)")
-st.markdown("---")
-
-# [2. 인공지능 모델 불러오기]
 @st.cache_resource
-def get_river_model():
-    # compile=False 옵션으로 버전 차이로 인한 에러를 원천 차단합니다.
+def get_model():
     return load_model('river_model_final.h5', compile=False)
 
-model = get_river_model()
+model = get_model()
 
-# [3. 깃허브에 올린 최신 CSV 데이터 로드]
-def load_github_data():
-    # 근우님의 깃허브 Raw 데이터 주소
+# [2. 데이터 로드]
+@st.cache_data
+def load_data():
     csv_url = "https://raw.githubusercontent.com/skys42781-create/river-ai/main/latest_river_data.csv"
-    
-    try:
-        # 깃허브 파일은 속도가 매우 빠르고 접속 제한이 없습니다.
-        df = pd.read_csv(csv_url)
-        return df
-    except Exception as e:
-        st.error(f"⚠️ 깃허브에서 데이터를 가져오지 못했습니다: {e}")
-        return None
+    df = pd.read_csv(csv_url)
+    rename_rule = {'rf': '강수량', 'fw': '유량', 'ymdhm': '날짜', '년월일(yyyyMMdd)': '날짜'}
+    df = df.rename(columns=rename_rule)
+    df[['강수량', '유량']] = df[['강수량', '유량']].apply(pd.to_numeric, errors='coerce')
+    return df.dropna().query("강수량 >= 0 and 유량 >= 0").sort_values('날짜')
 
-# [4. 메인 대시보드 구성]
-st.sidebar.header("🕹️ 시스템 제어")
-if st.sidebar.button("🔄 최신 분석 결과 업데이트"):
-    st.rerun()
+df = load_data()
 
-# 데이터 로드 실행
-df_raw = load_github_data()
+# [3. 컨트롤 패널: T값 설정]
+st.sidebar.header("⚙️ 예측 설정")
+target_t = st.sidebar.slider("예측 목표일(T) 선택", min_value=1, max_value=3, value=1, help="오늘(T=0) 기준으로 며칠 뒤를 볼지 정합니다.")
 
-if df_raw is not None:
-    # --- 데이터 무결성 검토 및 전처리 ---
-    # CSV에서 읽어온 컬럼명을 표준화합니다.
-    df = df_raw.copy()
+if df is not None and len(df) >= 10:
+    # 데이터 전처리
+    scaler = MinMaxScaler()
+    data_val = df[['강수량', '유량']].values
+    scaled = scaler.fit_transform(data_val)
     
-    # 숫자형 변환 (혹시 모를 문자열 방지)
-    df['강수량(mm)'] = pd.to_numeric(df['강수량(mm)'], errors='coerce')
-    df['유량(m3/s)'] = pd.to_numeric(df['유량(m3/s)'], errors='coerce')
+    # [4. 실시간 오차율(Performance) 계산]
+    # 최근 데이터를 사용해 과거 예측이 얼마나 정확했는지 검증
+    # (주의: 실제 현장에서는 과거 데이터를 밀어넣어 예측값과 실제값의 차이를 구함)
+    test_input = []
+    test_real = []
+    for i in range(len(scaled) - 7 - target_t):
+        test_input.append(scaled[i:i+7])
+        test_real.append(scaled[i+7+(target_t-1), 1]) # 유량(1번 인덱스) 타겟값
     
-    # 결측치 제거 및 물리적 오류(음수) 필터링
-    df = df.dropna().query("`강수량(mm)` >= 0 and `유량(m3/s)` >= 0")
-    df = df.sort_values('년월일(yyyyMMdd)')
+    test_input = np.array(test_input)
+    y_pred_scaled = model.predict(test_input, verbose=0)[:, target_t-1]
     
-    if len(df) >= 7:
-        st.success(f"✅ 데이터 동기화 완료: {df['년월일(yyyyMMdd)'].iloc[-1]} 기준")
-        
-        # [5. 인공지능 예측 실행]
-        # 모델 학습 시 사용했던 MinMaxScaler와 동일한 구조로 스케일링
-        scaler = MinMaxScaler()
-        scaled_data = scaler.fit_transform(df[['강수량(mm)', '유량(m3/s)']].values)
-        
-        # 최근 7일 데이터를 입력값으로 사용 (1, 7, 2 구조)
-        recent_input = scaled_data[-7:].reshape(1, 7, 2)
-        pred_scaled = model.predict(recent_input, verbose=0)[0]
-        
-        # 역정규화 (예측된 스케일 값을 실제 m3/s 단위로 복원)
-        def inverse_val(s_val):
-            dummy = np.zeros((1, 2))
-            dummy[0, 1] = s_val
-            return scaler.inverse_transform(dummy)[0, 1]
-        
-        # [6. 결과 화면 출력]
-        st.subheader("📅 향후 3일간 유량 예측 결과")
-        c1, c2, c3 = st.columns(3)
-        
-        labels = ["내일 (T+1)", "모레 (T+2)", "글피 (T+3)"]
-        preds = [inverse_val(p) for p in pred_scaled]
-        
-        for i, (label, val) in enumerate(zip(labels, preds)):
-            with [c1, c2, c3][i]:
-                st.metric(label, f"{val:.2f} m³/s")
-        
-        # [7. 관측 데이터 시각화]
-        st.divider()
-        st.subheader("📊 최근 10일간의 수문 데이터 흐름")
-        st.dataframe(df.tail(10), use_container_width=True)
-        
-        # 간단한 라인 차트 추가
-        st.line_chart(df.tail(15).set_index('년월일(yyyyMMdd)')['유량(m3/s)'])
+    # 역정규화 (오차 계산용)
+    def denormalize(val):
+        d = np.zeros((len(val), 2))
+        d[:, 1] = val
+        return scaler.inverse_transform(d)[:, 1]
 
-    else:
-        st.warning("예측을 위한 데이터(최소 7일치)가 부족합니다. CSV 파일을 확인해 주세요.")
-else:
-    st.info("데이터를 불러오는 중입니다. 잠시만 기다려 주세요.")
+    y_real_final = denormalize(np.array(test_real))
+    y_pred_final = denormalize(y_pred_scaled)
+    
+    # 지표 계산
+    mae = mean_absolute_error(y_real_final, y_pred_final)
+    rmse = np.sqrt(mean_squared_error(y_real_final, y_pred_final))
+    mape = np.mean(np.abs((y_real_final - y_pred_final) / y_real_final)) * 100
+
+    # [5. 대시보드 출력]
+    st.subheader(f"📊 T+{target_t}일 뒤 예측 성능 (최근 데이터 기준)")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("평균 절대 오차 (MAE)", f"{mae:.2f} m³/s")
+    m2.metric("제곱근 평균 오차 (RMSE)", f"{rmse:.2f} m³/s")
+    m3.metric("평균 오차율 (MAPE)", f"{mape:.1f} %")
+
+    # [6. 최종 예측 (현재 시점)]
+    st.divider()
+    curr_input = scaled[-7:].reshape(1, 7, 2)
+    final_pred_scaled = model.predict(curr_input, verbose=0)[0, target_t-1]
+    
+    # 단일 값 역정규화
+    dummy = np.zeros((1, 2))
+    dummy[0, 1] = final_pred_scaled
+    final_pred = scaler.inverse_transform(dummy)[0, 1]
+    
+    st.subheader(f"📅 실시간 예측: T+{target_t}일 유량")
+    st.markdown(f"### 예상 유량: <span style='color:blue'>{final_pred:.2f} m³/s</span>", unsafe_allow_html=True)
+    
+    # [7. 시각화] 실제 vs 예측 비교
+    chart_df = pd.DataFrame({
+        '실제 관측치': y_real_final,
+        '모델 예측치': y_pred_final
+    })
+    st.line_chart(chart_df.tail(20))
