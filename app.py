@@ -13,7 +13,7 @@ st.title("🌊 실시간 하천 유량 예측 및 성능 검증")
 # 1. 모델 및 데이터 로드
 @st.cache_resource
 def get_model():
-    return load_model('river_model_final.h5')
+    return load_model('river_model_final.h5', compile=False)
 
 model = get_model()
 
